@@ -1652,3 +1652,427 @@ if __name__ == "__main__":
 2. **Reliable RAG Traceability**: If a value seems incorrect, you don't need to look through hundreds of pages of PDFs. You can open `rag_database.json` and query the document text directly to see exactly what text was extracted.
 3. **No Local Model Context Overload**: Because `Script 2` processes files on an individual basis, your local **Qwen2.5-1.5B** model remains fast, responsive, and stays safely within its hardware limits.
 
+that will be impractical going forward, as i will be running this against many shipping folders.
+can the script use parent folder name with a wildcard somewhere to dervive the 
+
+"""
+    Queries the local SLM using strict few-shot examples to guarantee a raw JSON object
+    for shipment parent_folder%BA3087%name.
+    """
+
+Hardcoding the folder name or shipment reference into your script is completely impractical when scaling up to handle dozens of different shipping directories.
+
+To automate this dynamically, your extraction logic should determine the current folder context automatically. We can update **Script 2** to look at the relative file path, extract the actual parent shipment code (like `BA3087` or `BA2950`), and dynamically inject it into the prompt.
+
+Furthermore, to ensure a completely reliable automation loop, we can programmatically instruct the model to look for variables related to that specific folder context.
+
+Here is the fully dynamic version of **Script 2**. It eliminates hardcoded names and uses path manipulation to adjust its extraction strategy on the fly for every shipment folder it processes.
+
+### Dynamically Adjusted `2_query_rag.py`
+
+```python
+import os
+import json
+import re
+from openai import OpenAI
+
+def derive_shipment_reference(relative_path: str) -> str:
+    """
+    Extracts the shipment folder reference code from the file path.
+    For path: 'zCompleted-Shipment-Test-BA3087/document.pdf', it extracts 'BA3087'.
+    """
+    # Break down the path components
+    parts = relative_path.replace('\\', '/').split('/')
+    if not parts:
+        return ""
+    
+    # Analyze the top-most folder name (the root parent within your target folder)
+    parent_folder = parts[0]
+    
+    # Regular expression search to find pattern 'BA' followed by numbers (e.g., BA3087, BA2950)
+    match = re.search(r'(BA\d+)', parent_folder, re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+        
+    # Fallback: if 'BA' isn't explicitly found, use the clean parent folder name itself
+    return parent_folder
+
+def query_local_rag_fields(client, file_name: str, relative_path: str, raw_text: str) -> dict:
+    """
+    Queries the local SLM, dynamically tailoring the extraction prompt
+    based on the parent shipment reference derived from the folder path.
+    """
+    # Programmatically extract the folder token
+    shipment_ref = derive_shipment_reference(relative_path)
+    
+    # Construct a completely dynamic few-shot prompt using your wildcard concept
+    prompt = f"""
+Analyze the text from document '{file_name}'. Find and extract the logistical metadata parameters requested below.
+Focus on identifying references and data specific to the current shipment context: {shipment_ref}.
+
+Return ONLY a valid, plain JSON object. Do not wrap the response in markdown formatting codeblocks (such as ```json), notes, or introductions.
+
+[DATA EXTRACTION EXPECTED TEMPLATE SCHEMA]
+{{
+    "Client Ref": "Find the primary shipment reference matching tokens like {shipment_ref} or related transaction codes",
+    "Consignee": "Find the importer company or enterprise name, e.g., KAMOA COPPER SA",
+    "Description": "Find heavy machinery equipment models, e.g., ELPHINSTONE MOTOR GRADER",
+    "PIN No": "Find the vehicle PIN tracking code, usually starting with CAT...",
+    "Serial No": "Find the frame, chassis, or component serial markers",
+    "Vessel": "Identify the ocean shipping carrier if named explicitly, otherwise leave blank",
+    "Voy": "Identify the voyage routing identifier sequence code, otherwise leave blank",
+    "Tariff Code": "Extract the specific custom tariff classification code, e.g., 8429.20"
+}}
+
+[DOCUMENT CONTENT FOR ANALYSIS]:
+{raw_text[:7000]}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="qwen2.5-1.5b-instruct",
+            messages=[
+                {"role": "system", "content": "You are a rigid data utility. Output only strict JSON objects. Do not chat, explain, or output markdown blocks."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,  # Forces hard-deterministic extraction
+            max_tokens=500
+        )
+        
+        raw_output = response.choices[0].message.content.strip()
+        
+        # Clean out any accidental codeblock formats
+        clean_json_str = re.sub(r"```json|```", "", raw_output).strip()
+        return json.loads(clean_json_str)
+        
+    except json.JSONDecodeError:
+        print(f"   [Warning] Model returned invalid JSON format for {file_name}.")
+        return {}
+    except Exception as e:
+        print(f"   [Error] Extraction exception on file {file_name}: {e}")
+        return {}
+
+def extract_metadata_from_rag():
+    client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-no-key")
+    
+    try:
+        with open("rag_database.json", "r", encoding="utf-8") as f:
+            rag_db = json.load(f)
+    except FileNotFoundError:
+        print("[Fatal Error] 'rag_database.json' not found. Run Script 1 first.")
+        return
+
+    extracted_profiles = {}
+
+    print("Beginning dynamic metadata extraction from local RAG store...")
+    for rel_path, doc_data in rag_db.items():
+        if doc_data["status"] == "SUCCESS":
+            # Deriving reference dynamically for terminal logging clarity
+            current_ref = derive_shipment_reference(rel_path)
+            print(f" -> [{current_ref}] Extracting fields from: {rel_path}")
+            
+            # Pass the relative path directly so the function knows the context
+            metadata = query_local_rag_fields(client, doc_data["file_name"], rel_path, doc_data["raw_text"])
+            if metadata:
+                extracted_profiles[rel_path] = metadata
+        else:
+            print(f" -> Skipping file: {rel_path} (Status flag: {doc_data['status']})")
+
+    with open("structured_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(extracted_profiles, f, indent=4, ensure_ascii=False)
+        
+    print(f"\nSuccess! Extracted profiles saved to 'structured_metadata.json'")
+
+if __name__ == "__main__":
+    extract_metadata_from_rag()
+
+```
+
+### Why this fixes the practicality issue:
+
+1. **Zero-Touch Operation:** If your `rag_database.json` contains files from `C:\Users\Jason\Projects\zCompleted-Shipment-Test-BA3087` and `C:\Users\Jason\Projects\zCompleted-Shipment-Test-BA2950` simultaneously, the script evaluates each file independently, parses its specific path, and tells the AI to look for `BA3087` or `BA2950` respectively.
+2. **Deterministic String Injection:** The prompt formatting string (`f"""..."""`) processes the wildcard calculation locally inside Python before making the API call. The local model receives standard text customized for that specific document group.
+
+parent folder might have a folder name called "2604DSI2798 - BA3161 - CAT395 HYD EXC - ON HOLD - 04-06"
+2 most identifiable referrences are  company ref 2604DSI2798; shipping order number - BA3161 
+
+To make your automation bulletproof across all production folders, your script shouldn't rely on simple text splits. Folders like `"2604DSI2798 - BA3161 - CAT395 HYD EXC - ON HOLD - 04-06"` contain exactly what the local AI needs: a **Company Reference** (`2604DSI2798`) and a **Shipping Order Number** (`BA3161`).
+
+By isolating *both* tokens using pattern matching (`re`) directly in Python before prompting your local model, you can inject them as structured anchors. This gives your local **Qwen2.5-1.5B** exact coordinates to look for, ensuring it cross-references fields perfectly without getting confused by extra folder text like `- CAT395 HYD EXC - ON HOLD - 04-06`.
+
+Here is the updated, production-ready version of **Script 2**. It dynamically extracts both structural keys from your path patterns, adjusts the system prompts on the fly, and uses a `0.0` temperature to ensure reliable JSON extraction.
+
+### Complete Dynamic `2_query_rag.py`
+
+```python
+import os
+import json
+import re
+from openai import OpenAI
+
+def derive_shipment_context(relative_path: str) -> dict:
+    """
+    Analyzes the parent folder name to extract two key anchors:
+    1. Company Ref (e.g., 2604DSI2798)
+    2. Shipping Order / BA Number (e.g., BA3161)
+    """
+    # Normalize path separators and grab the top parent directory
+    parts = relative_path.replace('\\', '/').split('/')
+    parent_folder = parts[0] if parts else relative_path
+    
+    # Defaults in case patterns are missing
+    context = {
+        "company_ref": "NOT_FOUND",
+        "shipping_order": "NOT_FOUND",
+        "folder_raw": parent_folder
+    }
+    
+    # 1. Look for the Shipping Order Number (BA followed by numbers, e.g., BA3161)
+    ba_match = re.search(r'(BA\d+)', parent_folder, re.IGNORECASE)
+    if ba_match:
+        context["shipping_order"] = ba_match.group(1).upper()
+        
+    # 2. Look for the Company Reference (usually starts with numbers like 2602DS... or 2604DS...)
+    # This pattern matches any alphanumeric string starting with numbers followed by letters/digits
+    ref_match = re.search(r'(\d+[A-Z\d]+DS[A-Z\d]+)', parent_folder, re.IGNORECASE)
+    if ref_match:
+        context["company_ref"] = ref_match.group(1).upper()
+    else:
+        # Fallback regex if the reference pattern shifts slightly (e.g., matching the first segment before a hyphen)
+        fallback_match = re.search(r'^([A-Z0-9]{8,12})', parent_folder, re.IGNORECASE)
+        if fallback_match and not fallback_match.group(1).startswith("BA"):
+            context["company_ref"] = fallback_match.group(1).upper()
+
+    return context
+
+def query_local_rag_fields(client, file_name: str, relative_path: str, raw_text: str) -> dict:
+    """
+    Queries the local SLM, dynamically anchoring the prompt with the extracted
+    Company Reference and Shipping Order Number derived from the current path context.
+    """
+    # Dynamically extract context markers from the folder path
+    ctx = derive_shipment_context(relative_path)
+    
+    # Build anchor hints to guide the 1.5B model's attention window
+    hint_str = f"Company Reference: '{ctx['company_ref']}' and Shipping Order: '{ctx['shipping_order']}'"
+
+    prompt = f"""
+Analyze the text from document '{file_name}'. Find and extract the logistical metadata parameters requested below.
+Focus closely on identifying references and data linked to this shipment context: {hint_str}.
+
+Return ONLY a valid, plain JSON object. Do not wrap the response in markdown formatting codeblocks (such as ```json), notes, or introductions.
+
+[DATA EXTRACTION EXPECTED TEMPLATE SCHEMA]
+{{
+    "Client Ref": "Find the primary shipment reference matching or related to {ctx['shipping_order']} or {ctx['company_ref']}",
+    "Consignee": "Find the importer company or enterprise name, e.g., KAMOA COPPER SA",
+    "Description": "Find heavy machinery equipment models, e.g., ELPHINSTONE MOTOR GRADER or CAT EXC",
+    "PIN No": "Find the vehicle PIN tracking code, usually starting with CAT...",
+    "Serial No": "Find the frame, chassis, or component serial markers",
+    "Vessel": "Identify the ocean shipping carrier if named explicitly, otherwise leave blank",
+    "Voy": "Identify the voyage routing identifier sequence code, otherwise leave blank",
+    "Tariff Code": "Extract the specific custom tariff classification code, e.g., 8429.20"
+}}
+
+[DOCUMENT CONTENT FOR ANALYSIS]:
+{raw_text[:7000]}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model="qwen2.5-1.5b-instruct",
+            messages=[
+                {"role": "system", "content": "You are a strict data extraction engine. Output only raw JSON strings. Do not chat, explain, or output markdown wrappers."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,  # Zero temperature forces hard factual alignment
+            max_tokens=500
+        )
+        
+        raw_output = response.choices[0].message.content.strip()
+        
+        # Strip out any potential markdown codeblocks if generated by the model
+        clean_json_str = re.sub(r"```json|```", "", raw_output).strip()
+        return json.loads(clean_json_str)
+        
+    except json.JSONDecodeError:
+        print(f"   [Warning] Model failed string validation for {file_name}. Continuing...")
+        return {}
+    except Exception as e:
+        print(f"   [Error] Extraction exception on file {file_name}: {e}")
+        return {}
+
+def extract_metadata_from_rag():
+    client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-no-key")
+    
+    try:
+        with open("rag_database.json", "r", encoding="utf-8") as f:
+            rag_db = json.load(f)
+    except FileNotFoundError:
+        print("[Fatal Error] 'rag_database.json' not found. Run Script 1 first to index target directory paths.")
+        return
+
+    extracted_profiles = {}
+
+    print("Beginning contextual metadata extraction from local RAG store...")
+    for rel_path, doc_data in rag_db.items():
+        if doc_data["status"] == "SUCCESS":
+            # Extract current keys to populate clean dashboard tracking prints
+            ctx = derive_shipment_context(rel_path)
+            print(f" -> [{ctx['shipping_order']} / {ctx['company_ref']}] Extracting fields from: {rel_path}")
+            
+            metadata = query_local_rag_fields(client, doc_data["file_name"], rel_path, doc_data["raw_text"])
+            if metadata:
+                extracted_profiles[rel_path] = metadata
+        else:
+            print(f" -> Skipping file: {rel_path} (Status flag: {doc_data['status']})")
+
+    # Save to file for Script 3 to pick up
+    with open("structured_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(extracted_profiles, f, indent=4, ensure_ascii=False)
+        
+    print(f"\nSuccess! Extracted profiles saved to 'structured_metadata.json'")
+
+if __name__ == "__main__":
+    extract_metadata_from_rag()
+
+```
+
+### Why this approach handles messy folders perfectly:
+
+1. **Regular Expression Safety Guards:** The script pre-scans the file paths with standard Python regex logic. If the folder name contains messy comments like `"ON HOLD - 04-06"`, Python ignores them completely and pulls out exactly `"BA3161"` and `"2604DSI2798"`.
+2. **Context-Aware Anchoring:** The prompt dynamically formats with instructions like: *Focus closely on identifying references and data linked to this shipment context: Company Reference: '2604DSI2798' and Shipping Order: 'BA3161'*. This forces the 1.5B model to evaluate matching values with a high degree of confidence.
+3. **Multi-Folder Scalability:** You can now run **Script 1** against an entire parent directory containing 50 completely different shipment folders. Script 2 will run through them, track their individual metadata points based on their unique parent values, and save them safely to your staging file.
+
+the 1_build_rag.py caters for .pdf files, correct?
+
+**Yes, that is completely correct.** The current version of `1_build_rag.py` is specifically locked down to scan for files ending with `.pdf` (using the conditional logic `if file.lower().endswith('.pdf'):`). It treats PDF files as the primary source documents for your logistics shipments.
+
+However, since your operations team relies on a combination of different file types inside each shipment folder—such as commercial invoices, dynamic tracking forms, and your master Excel template—we should look closely at how the script handles what it finds:
+
+### 1. Standard PDF Documents (e.g., `XE ENTRY - BA2950.pdf`)
+
+* **How it handles them:** The script opens them via `pypdf`, extracts the raw text page-by-page, and pushes the text straight into `rag_database.json` with a status of `"SUCCESS"`.
+* This provides your local model with the exact text strings it needs to look for (like values, agent names, and serial numbers).
+
+### 2. Unrendered Dynamic Forms (e.g., `WE CN1 - BA2950.pdf`)
+
+* **How it handles them:** If you look closely at the text inside some of your tracking documents, they contain a standard Adobe message: *"Please wait... If this message is not eventually replaced by the proper contents of the document, your PDF viewer may not be able to display this type of document."*
+* Because these are dynamic XFA forms (interactive data streams rather than flat text pages), standard PDF readers cannot read their hidden data fields.
+* **The Script's Safety Feature:** `1_build_rag.py` is already designed to catch this specific scenario! It scans for that exact *"Please wait..."* sentence, marks the file status as `"XFA_RENDER_ERROR"`, and skips passing it to the AI. This prevents your local `llama-server` from processing useless error text and wasting system resources.
+
+### 3. What about `FILE CHECKLIST.xlsx`?
+
+* **How it handles it:** Because the script uses `if file.lower().endswith('.pdf'):`, your native Excel checklist files (`.xlsx` or `.csv`) are completely ignored during the ingestion stage. This is intentional; you do not want your blank template data polluting the raw text RAG database.
+
+### Summary Checklist for Ingestion
+
+When you point `1_build_rag.py` at your test directory `C:\Users\Jason\Projects\zCompleted-Shipment-Test-BA3087`:
+
+1. It will pick up every flat text `.pdf` document.
+2. It will isolate and flag any unrendered interactive dynamic `.pdf` forms.
+3. It will safely bypass `.xlsx`, `.csv`, or image files so that `rag_database.json` remains a clean, high-density text repository for **Script 2** to query.
+
+
+update the script to include .md files with .pdf
+
+To include `.md` (Markdown) files alongside your `.pdf` files in the RAG ingestion stage, you need to update **Script 1** (`1_build_rag.py`).
+
+Because Markdown files are plain text, you don't need a heavy library like `pypdf` to read them. Python can open and read them directly using standard built-in file handling (`open()`).
+
+Below is the updated **Script 1** configured to track both extensions seamlessly. It dynamically processes the `.pdf` binaries while simultaneously ingesting `.md` plain text notes.
+
+### Updated `1_build_rag.py`
+
+```python
+import os
+import json
+from pypdf import PdfReader
+
+def extract_raw_text_from_pdf(pdf_path: str) -> str:
+    """Extracts all text from a PDF document safely page-by-page."""
+    try:
+        reader = PdfReader(pdf_path)
+        full_text = []
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text:
+                full_text.append(f"--- PAGE {i+1} ---\n{text}")
+        return "\n\n".join(full_text)
+    except Exception as e:
+        return f"[ERROR] Unreadable PDF file: {e}"
+
+def extract_raw_text_from_md(md_path: str) -> str:
+    """Reads a text-based Markdown file directly using standard encoding."""
+    try:
+        with open(md_path, 'r', encoding='utf-8', errors='ignore') as f:
+            return f.read()
+    except Exception as e:
+        return f"[ERROR] Unreadable Markdown file: {e}"
+
+def run_ingestion(parent_dir: str, rag_json_path: str):
+    database = {}
+    if not os.path.exists(parent_dir):
+        print(f"[Error] Target directory '{parent_dir}' does not exist.")
+        return
+
+    print(f"Indexing shipment files (.pdf & .md) into local RAG store from: '{parent_dir}'")
+    
+    for root, _, files in os.walk(parent_dir):
+        for file in files:
+            file_lower = file.lower()
+            
+            # Match both PDF and Markdown files
+            if file_lower.endswith('.pdf') or file_lower.endswith('.md'):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, parent_dir)
+                
+                # Determine file type and execute matching extraction pipeline
+                if file_lower.endswith('.pdf'):
+                    print(f" -> [PDF] Extracting: {rel_path}")
+                    extracted_text = extract_raw_text_from_pdf(full_path)
+                    
+                    # Run safety check for unrendered interactive XFA forms
+                    if "Please wait... If this message is not eventually replaced" in extracted_text:
+                        status = "XFA_RENDER_ERROR"
+                    elif not extracted_text.strip():
+                        status = "EMPTY_OR_SCANNED_PDF"
+                    else:
+                        status = "SUCCESS"
+                        
+                elif file_lower.endswith('.md'):
+                    print(f" -> [MD]  Reading: {rel_path}")
+                    extracted_text = extract_raw_text_from_md(full_path)
+                    
+                    if not extracted_text.strip():
+                        status = "EMPTY_MARKDOWN"
+                    else:
+                        status = "SUCCESS"
+
+                # Commit entry to the unified RAG database object
+                database[rel_path] = {
+                    "file_name": file,
+                    "relative_path": rel_path,
+                    "file_type": "PDF" if file_lower.endswith('.pdf') else "MARKDOWN",
+                    "status": status,
+                    "raw_text": extracted_text
+                }
+
+    # Write out the structural text database
+    with open(rag_json_path, 'w', encoding='utf-8') as f:
+        json.dump(database, f, indent=4, ensure_ascii=False)
+        
+    print(f"\nRAG Database initialized with {len(database)} total indexed files.")
+
+if __name__ == "__main__":
+    TEST_DIRECTORY = r"C:\Users\Jason\Projects\zCompleted-Shipment-Test-BA3087"
+    run_ingestion(TEST_DIRECTORY, "rag_database.json")
+
+```
+
+### Why this is a valuable update:
+
+1. **Unified Text Pipeline:** Both file formats are normalized into a unified `"raw_text"` field. When **Script 2** (`2_query_rag.py`) reads this file, it doesn't care whether the source text originally came from a PDF or a Markdown file; it just reads the data and extracts the metrics.
+2. **Metadata Tagging:** The script explicitly adds a `"file_type"` key (`"PDF"` or `"MARKDOWN"`) inside the JSON. This ensures you can audit the data trail later if you need to trace where a specific reference number came from.
+3. **No Script 2 or 3 Changes Required:** Because the structural layout of `rag_database.json` remains identical, you can run this script to update your database, then execute your existing `2_query_rag.py` and `3_excel_ops.py` files without making any further changes.
+
