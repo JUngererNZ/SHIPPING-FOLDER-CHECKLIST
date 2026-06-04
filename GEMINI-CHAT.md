@@ -1379,3 +1379,276 @@ if __name__ == "__main__":
 1. **The Ingestion Database (`raw_database.json`)** serves as a lightweight text-based **Vectorless RAG context store**. If you want to scale this to a true RAG database later (using Vector tools like ChromaDB or FAISS), you only need to update Script 1 to pass the text fragments to an embedding model.
 2. **Deterministic Metadata Extraction**: Script 3 instructs the model to return *only structured JSON keys*. This constraints the small local Qwen model from generating paragraphs and forces it to strictly extract precise values (like pulling `CAT00120CE9601160` and placing it directly into cell row coordinates).
 
+----------------------------------
+
+the end goal is to complete the FILE CHECKLIST.xlsx file with as much information as possible.
+if there is a short on information to use the robot light punction to highlight / mark the cell that information is reguired
+the FILE CHECKLIST.xlsx will be used to make sure that the ops team is on top of tasks. if a cell is marked amber, the action is required.
+the scripts will be used to create a RAG database in JSON format, then the otherscript to read from RAG and update FILE CHECKLIST.xlsx
+
+This shifted, multi-stage architecture is exactly how automated industrial operations platforms are built. By using your JSON-based **Vectorless RAG store** as the persistent truth source, you decouple data extraction from business rule execution.
+
+When working with a small model like **Qwen2.5-1.5B**, this approach prevents errors because you don't ask it to edit Excel directly. Instead, you extract parameters into clean JSON data fields, and let native Python logic update your spreadsheet, calculate missing rows, and apply cell color fills.
+
+Because your checklist spreadsheet structure matches the layout in `FILE CHECKLIST.xlsx - Sheet1.csv`, we can use `openpyxl` to write directly to an `.xlsx` file, adding **Conditional Styling** (Green for found, Amber for missing/action-required data fields).
+
+### The 3-Script Automation Ecosystem
+
+```
+  [PDF Folder Tree]
+          │
+          ▼
+┌──────────────────┐
+│ 1_build_rag.py   │ ──► Reads text, tags form errors, outputs `rag_database.json`
+└──────────────────┘
+          │
+          ▼
+┌──────────────────┐
+│ 2_query_rag.py   │ ──► Local AI finds specific keys, outputs `structured_metadata.json`
+└──────────────────┘
+          │
+          ▼
+┌──────────────────┐
+│ 3_excel_ops.py   │ ──► Matches keys, fills Excel, marks missing values AMBER
+└──────────────────┘
+
+```
+
+---
+
+### Prerequisites
+
+Install the required tools for local document text extraction, AI API emulation, and Excel generation:
+
+```bash
+pip install pypdf openai openpyxl pandas
+
+```
+
+---
+
+### Script 1: Ingest & Populate RAG Database (`1_build_rag.py`)
+
+This script crawls your main directory and subdirectories, indexes the raw text, handles dynamic XFA errors, and saves a persistent JSON database.
+
+```python
+import os
+import json
+from pypdf import PdfReader
+
+def extract_raw_text(pdf_path: str) -> str:
+    try:
+        reader = PdfReader(pdf_path)
+        full_text = []
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            if text:
+                full_text.append(text)
+        return "\n".join(full_text)
+    except Exception as e:
+        return f"[ERROR] Unreadable file: {e}"
+
+def run_ingestion(parent_dir: str, rag_json_path: str):
+    database = {}
+    if not os.path.exists(parent_dir):
+        print(f"[Error] Target folder '{parent_dir}' does not exist.")
+        return
+
+    print(f"Indexing files into Vectorless RAG store: '{parent_dir}'")
+    for root, _, files in os.walk(parent_dir):
+        for file in files:
+            if file.lower().endswith('.pdf'):
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, parent_dir)
+                
+                print(f" -> Indexing: {rel_path}")
+                extracted_text = extract_raw_text(full_path)
+                
+                if "Please wait... If this message is not eventually replaced" in extracted_text:
+                    status = "XFA_RENDER_ERROR"
+                elif not extracted_text.strip():
+                    status = "EMPTY_OR_SCANNED"
+                else:
+                    status = "SUCCESS"
+
+                database[rel_path] = {
+                    "file_name": file,
+                    "relative_path": rel_path,
+                    "status": status,
+                    "raw_text": extracted_text
+                }
+
+    with open(rag_json_path, 'w', encoding='utf-8') as f:
+        json.dump(database, f, indent=4, ensure_ascii=False)
+    print(f"\nRAG Database initialized with {len(database)} records.")
+
+if __name__ == "__main__":
+    run_ingestion("./customs_documents", "rag_database.json")
+
+```
+
+---
+
+### Script 2: RAG Extraction Engine (`2_query_rag.py`)
+
+This script queries your local `llama-server`. It scans through the text data stored inside `rag_database.json` and uses structural constraint definitions to extract exactly the parameters needed to fill out your operations checklist.
+
+```python
+import json
+import re
+from openai import OpenAI
+
+def query_local_rag_fields(client, file_name: str, raw_text: str) -> dict:
+    """Uses the local model to extract single target parameter keys from the RAG store."""
+    prompt = f"""
+Analyze the extracted document text for file '{file_name}'. Find and extract the exact parameters requested below.
+Return ONLY a valid, plain JSON object. Do not include markdown codeblocks, text wrappers, explanations, or notes.
+
+Required JSON Structure:
+{{
+    "Client Ref": "Look for matching transaction reference tokens like 2602DS12783 or BA2950",
+    "Consignee": "Look for the target importer business or enterprise, e.g., KAMOA COPPER SA",
+    "Description": "Look for equipment or industrial goods names, e.g., ELPHINSTONE EG20 MOTOR GRADER",
+    "PIN No": "Look for unique PIN tracking numbers, often starting with CAT...",
+    "Serial No": "Look for the chassis, equipment, or frame serial number",
+    "Vessel": "Identify the container vessel if named, e.g., TRANCURA",
+    "Voy": "Identify the specific voyage sequence number, e.g., 612S",
+    "Tariff Code": "Extract the customs HS Tariff code classification, e.g., 8429.20"
+}}
+
+Document Text Segment:
+{raw_text[:6000]}
+"""
+    try:
+        response = client.chat.completions.create(
+            model="qwen2.5-1.5b-instruct",
+            messages=[
+                {"role": "system", "content": "You are a rigid data utility. Output only clean, valid JSON strings. Do not chat."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            max_tokens=450
+        )
+        # Strip out any potential markdown wrapper formatting codeblocks if generated by the model
+        clean_json = re.sub(r"```json|```", "", response.choices[0].message.content).strip()
+        return json.loads(clean_json)
+    except Exception as e:
+        print(f"   Extraction exception on file {file_name}: {e}")
+        return {}
+
+def extract_metadata_from_rag():
+    client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-no-key")
+    
+    with open("rag_database.json", "r", encoding="utf-8") as f:
+        rag_db = json.load(f)
+
+    extracted_profiles = {}
+
+    for rel_path, doc_data in rag_db.items():
+        if doc_data["status"] == "SUCCESS":
+            print(f"Querying local RAG for keys inside: {rel_path}")
+            metadata = query_local_rag_fields(client, doc_data["file_name"], doc_data["raw_text"])
+            if metadata:
+                extracted_profiles[rel_path] = metadata
+        else:
+            print(f"Skipping: {rel_path} (Status: {doc_data['status']})")
+
+    with open("structured_metadata.json", "w", encoding="utf-8") as f:
+        json.dump(extracted_profiles, f, indent=4, ensure_ascii=False)
+    print("\nMetadata processing complete. Results saved to 'structured_metadata.json'")
+
+if __name__ == "__main__":
+    extract_metadata_from_rag()
+
+```
+
+---
+
+### Script 3: Spreadsheet Checklist Target Populator (`3_excel_ops.py`)
+
+This script matches your data directly to the layout of your operational files. It reads `structured_metadata.json`, patches the cells, checks if information is missing or blank, and highlights those cells with an **Amber fill color** to flag required actions for your operations team.
+
+```python
+import json
+import openpyxl
+from openpyxl.styles import PatternFill
+
+def populate_ops_checklist(source_template_xlsx: str, output_xlsx: str):
+    # Load up all extracted profiles from our RAG query step
+    with open("structured_metadata.json", "r", encoding="utf-8") as f:
+        extracted_data = json.load(f)
+
+    # Consolidate all parameters discovered across files to patch the master sheet
+    master_field_map = {}
+    for path, fields in extracted_data.items():
+        for key, value in fields.items():
+            # If we found a valid value, add it to our update map
+            if value and "unknown" not in str(value).lower() and str(value).strip() != "":
+                master_field_map[key] = str(value).strip()
+
+    print("Master Discovered Data Matrix to apply:")
+    print(json.dumps(master_field_map, indent=2))
+
+    # Open the operational file using openpyxl for stylization
+    print(f"\nOpening workbook checklist template: {source_template_xlsx}")
+    wb = openpyxl.load_workbook(source_template_xlsx)
+    ws = wb.active # Grabs the active operations checklist sheet
+
+    # Map the checklist data row cells to match your template fields
+    # Format matches: Column A = Label String, Column B = Operational Value cell
+    field_row_locations = {
+        "Client Ref": 2,    # Cell B2
+        "Consignee": 3,     # Cell B3
+        "Description": 4,   # Cell B4
+        "PIN No": 5,        # Cell B5
+        "Serial No": 6,     # Cell B6
+        "Vessel": 7,        # Cell B7
+        "Voy": 8,           # Cell B8
+        "Tariff Code": 11   # Cell B11 ("Tarrif Code, Weight & Cube")
+    }
+
+    # Define our operational status colors (Hex format codes)
+    amber_fill = PatternFill(start_color="FFBF00", end_color="FFBF00", fill_type="solid")  # Action Required Alert
+    green_fill = PatternFill(start_color="C1E1C1", end_color="C1E1C1", fill_type="solid")  # Completed/Found
+
+    print("\nApplying updates and analyzing operational gaps...")
+    for field_name, row_num in field_row_locations.items():
+        cell = ws.cell(row=row_num, column=2) # Target column B
+        
+        # Check if our RAG pipeline successfully found the field value
+        if field_name in master_field_map:
+            cell.value = master_field_map[field_name]
+            cell.fill = green_fill
+            print(f" [COMPLETE] Row {row_num} - {field_name} populated with: {cell.value}")
+        else:
+            # Field value is missing. Keep the cell empty or log as missing and apply Amber highlighting
+            if not cell.value or str(cell.value).strip() == "":
+                cell.value = ""
+                cell.fill = amber_fill
+                print(f" [ACTION REQUIRED] Row {row_num} - {field_name} is missing. Marked AMBER.")
+            else:
+                # Cell already has hardcoded data in the template (e.g. your template had client pre-filled)
+                cell.fill = green_fill
+                print(f" [EXISTING DATA] Row {row_num} - {field_name} contains static template data: {cell.value}")
+
+    # Write modifications out to the production master folder execution sheet
+    wb.save(output_xlsx)
+    print(f"\nSuccess! Operational checklist saved as: '{output_xlsx}'")
+
+if __name__ == "__main__":
+    # Point this to your real native excel .xlsx workbook file path
+    INPUT_TEMPLATE = "FILE CHECKLIST.xlsx" 
+    OUTPUT_PRODUCTION_SHEET = "PRODUCTION_FILE_CHECKLIST.xlsx"
+    
+    populate_ops_checklist(INPUT_TEMPLATE, OUTPUT_PRODUCTION_SHEET)
+
+```
+
+---
+
+### How this benefits your operations team:
+
+1. **Clear Visual Gaps (Amber Alerts)**: When the ops team opens `PRODUCTION_FILE_CHECKLIST.xlsx`, any cell the model could not safely locate within the document folder tree (like a missing `PIN No` or unlisted `Voyage Number`) will immediately show as bright Amber, making it obvious where action is needed.
+2. **Reliable RAG Traceability**: If a value seems incorrect, you don't need to look through hundreds of pages of PDFs. You can open `rag_database.json` and query the document text directly to see exactly what text was extracted.
+3. **No Local Model Context Overload**: Because `Script 2` processes files on an individual basis, your local **Qwen2.5-1.5B** model remains fast, responsive, and stays safely within its hardware limits.
+
