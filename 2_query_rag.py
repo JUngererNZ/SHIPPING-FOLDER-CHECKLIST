@@ -1,65 +1,130 @@
+import os
 import json
 import re
 from openai import OpenAI
 
-def query_local_rag_fields(client, file_name: str, raw_text: str) -> dict:
-    """Queries the local SLM to gather exact metadata items from document streams."""
-    prompt = f"""
-Analyze the extracted document text for file '{file_name}'. Extract the exact metadata variables requested below.
-Return ONLY a valid, plain JSON object. Do not wrap the response in markdown codeblocks (such as ```json), notes, or descriptive text.
+def derive_shipment_context(relative_path: str) -> dict:
+    """
+    Analyzes the parent folder name to extract two key anchors:
+    1. Company Ref (e.g., 2604DSI2798)
+    2. Shipping Order / BA Number (e.g., BA3161)
+    """
+    # Normalize path separators and grab the top parent directory
+    parts = relative_path.replace('\\', '/').split('/')
+    parent_folder = parts[0] if parts else relative_path
+    
+    # Defaults in case patterns are missing
+    context = {
+        "company_ref": "NOT_FOUND",
+        "shipping_order": "NOT_FOUND",
+        "folder_raw": parent_folder
+    }
+    
+    # 1. Look for the Shipping Order Number (BA followed by numbers, e.g., BA3161)
+    ba_match = re.search(r'(BA\d+)', parent_folder, re.IGNORECASE)
+    if ba_match:
+        context["shipping_order"] = ba_match.group(1).upper()
+        
+    # 2. Look for the Company Reference (usually starts with numbers like 2602DS... or 2604DS...)
+    # This pattern matches any alphanumeric string starting with numbers followed by letters/digits
+    ref_match = re.search(r'(\d+[A-Z\d]+DS[A-Z\d]+)', parent_folder, re.IGNORECASE)
+    if ref_match:
+        context["company_ref"] = ref_match.group(1).upper()
+    else:
+        # Fallback regex if the reference pattern shifts slightly (e.g., matching the first segment before a hyphen)
+        fallback_match = re.search(r'^([A-Z0-9]{8,12})', parent_folder, re.IGNORECASE)
+        if fallback_match and not fallback_match.group(1).startswith("BA"):
+            context["company_ref"] = fallback_match.group(1).upper()
 
-Target JSON Data Layout Object:
+    return context
+
+def query_local_rag_fields(client, file_name: str, relative_path: str, raw_text: str) -> dict:
+    """
+    Queries the local SLM, dynamically anchoring the prompt with the extracted
+    Company Reference and Shipping Order Number derived from the current path context.
+    """
+    # Dynamically extract context markers from the folder path
+    ctx = derive_shipment_context(relative_path)
+    
+    # Build anchor hints to guide the 1.5B model's attention window
+    hint_str = f"Company Reference: '{ctx['company_ref']}' and Shipping Order: '{ctx['shipping_order']}'"
+
+    prompt = f"""
+Analyze the text from document '{file_name}'. Find and extract the logistical metadata parameters requested below.
+Focus closely on identifying references and data linked to this shipment context: {hint_str}.
+
+Return ONLY a valid, plain JSON object. Do not wrap the response in markdown formatting codeblocks (such as ```json), notes, or introductions.
+
+[DATA EXTRACTION EXPECTED TEMPLATE SCHEMA]
 {{
-    "Client Ref": "Look for matching transaction reference tokens like 2602DS12783 or BA3087",
-    "Consignee": "Look for the target importer company or business name, e.g., KAMOA COPPER SA",
-    "Description": "Look for equipment models or industrial goods labels, e.g., ELPHINSTONE MOTOR GRADER",
-    "PIN No": "Look for unique vehicle PIN identifiers, often starting with CAT...",
-    "Serial No": "Look for the vehicle frame, chassis, or equipment component serial markers",
-    "Vessel": "Identify the ocean shipping carrier if named, e.g., TRANCURA",
-    "Voy": "Identify the tracking sea voyage sequence number, e.g., 612S",
+    "Client Ref": "Find the primary shipment reference matching or related to {ctx['shipping_order']} or {ctx['company_ref']}",
+    "Consignee": "Find the importer company or enterprise name, e.g., KAMOA COPPER SA",
+    "Description": "Find heavy machinery equipment models, e.g., ELPHINSTONE MOTOR GRADER or CAT EXC",
+    "PIN No": "Find the vehicle PIN tracking code, usually starting with CAT...",
+    "Serial No": "Find the frame, chassis, or component serial markers",
+    "Vessel": "Identify the ocean shipping carrier if named explicitly, otherwise leave blank",
+    "Voy": "Identify the voyage routing identifier sequence code, otherwise leave blank",
     "Tariff Code": "Extract the specific custom tariff classification code, e.g., 8429.20"
 }}
 
-Document Text Segment:
-{raw_text[:6000]}
+[DOCUMENT CONTENT FOR ANALYSIS]:
+{raw_text[:7000]}
 """
+
     try:
         response = client.chat.completions.create(
             model="qwen2.5-1.5b-instruct",
             messages=[
-                {"role": "system", "content": "You are a rigid data utility. Output only strict JSON strings. Do not chat or add explanations."},
+                {"role": "system", "content": "You are a strict data extraction engine. Output only raw JSON strings. Do not chat, explain, or output markdown wrappers."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.0,
-            max_tokens=450
+            temperature=0.0,  # Zero temperature forces hard factual alignment
+            max_tokens=500
         )
-        # Strip codeblock wrappers if generated by the model despite instructions
-        clean_json = re.sub(r"```json|```", "", response.choices[0].message.content).strip()
-        return json.loads(clean_json)
+        
+        raw_output = response.choices[0].message.content.strip()
+        
+        # Strip out any potential markdown codeblocks if generated by the model
+        clean_json_str = re.sub(r"```json|```", "", raw_output).strip()
+        return json.loads(clean_json_str)
+        
+    except json.JSONDecodeError:
+        print(f"   [Warning] Model failed string validation for {file_name}. Continuing...")
+        return {}
     except Exception as e:
-        print(f"   Extraction failure on file {file_name}: {e}")
+        print(f"   [Error] Extraction exception on file {file_name}: {e}")
         return {}
 
 def extract_metadata_from_rag():
     client = OpenAI(base_url="http://localhost:8000/v1", api_key="local-no-key")
     
-    with open("rag_database.json", "r", encoding="utf-8") as f:
-        rag_db = json.load(f)
+    try:
+        with open("rag_database.json", "r", encoding="utf-8") as f:
+            rag_db = json.load(f)
+    except FileNotFoundError:
+        print("[Fatal Error] 'rag_database.json' not found. Run Script 1 first to index target directory paths.")
+        return
 
     extracted_profiles = {}
 
+    print("Beginning contextual metadata extraction from local RAG store...")
     for rel_path, doc_data in rag_db.items():
         if doc_data["status"] == "SUCCESS":
-            print(f"Querying local RAG for data elements inside: {rel_path}")
-            metadata = query_local_rag_fields(client, doc_data["file_name"], doc_data["raw_text"])
+            # Extract current keys to populate clean dashboard tracking prints
+            ctx = derive_shipment_context(rel_path)
+            print(f" -> [{ctx['shipping_order']} / {ctx['company_ref']}] Extracting fields from: {rel_path}")
+            
+            metadata = query_local_rag_fields(client, doc_data["file_name"], rel_path, doc_data["raw_text"])
             if metadata:
                 extracted_profiles[rel_path] = metadata
         else:
-            print(f"Skipping file: {rel_path} (Status flag: {doc_data['status']})")
+            print(f" -> Skipping file: {rel_path} (Status flag: {doc_data['status']})")
 
+    # Save to file for Script 3 to pick up
     with open("structured_metadata.json", "w", encoding="utf-8") as f:
         json.dump(extracted_profiles, f, indent=4, ensure_ascii=False)
-    print("\nMetadata processing complete. Results committed to 'structured_metadata.json'.")
+        
+    print(f"\nSuccess! Extracted profiles saved to 'structured_metadata.json'")
 
 if __name__ == "__main__":
     extract_metadata_from_rag()
